@@ -1,0 +1,154 @@
+import sqlite3
+from flask import Flask, request
+from helper_functions import build_xml
+import string
+
+app = Flask(__name__)
+
+@app.route("/" , methods=["GET"])
+def _index():
+
+    return '''<h1>Exchange Rates</h1><p>A prototype API for getting the current exchange rates.</p>'''
+
+
+@app.route("/current")
+def current():
+    """This functions is called when a get request is made with base url http://localhost:5000/current?
+       it is necessary to send 5 parameters with the base url
+       The parameters are
+       auth, currency, source, get_historic, change_base
+    """
+    args = request.args
+    conn = sqlite3.connect("ExchangeRates.db")
+    cursor = conn.cursor()
+    user_args = args.to_dict(flat=False)
+    user_args = {k: [x.strip() for x in v] for k, v in user_args.items()}
+
+    # Check if received authentication key is valid
+    user_auth = user_args["auth"][0]
+    auth_table = cursor.execute("SELECT KEY FROM AUTHENTICATION WHERE KEY = ?;", [user_auth])
+    if not auth_table.fetchone():
+        return "Authentication Error: " + user_auth + " is an invalid authentication key"
+
+    # Retrieves valid arguments for a request
+    cursor.execute("SELECT NAME FROM ARGS")
+    rows = cursor.fetchall()
+    args_db = [row[0] for row in rows]
+    valid_db_arg_count = len(args_db)
+
+
+
+    # Checks if received arguments are valid, if values are not empty or if received correct number of arguments
+
+    # # # # We can create errors as variables like in my ones
+    valid_user_arg_count = 0
+    for arg, val in user_args.items():
+        if arg.strip() not in args_db:
+            return "Error: " + str(arg) + " is not a valid parameter"
+        if "" in val:
+            pos = val.index("") + 1
+            return "Error:  " + str(arg) + " is empty in position number #" + str(pos) + ". Please enter a valid value."
+        else:
+            user_args
+            valid_user_arg_count += 1
+    if valid_user_arg_count != valid_db_arg_count:
+        return "Error: expected " + str(valid_db_arg_count) + " parameters but received " + str(valid_user_arg_count) + " parameters."
+
+
+    # Check if received get_historic argument is valid
+    user_get_historic = user_args['get_historic'][0] # Received get_historic argument
+    valid_get_historic = ["T", "F"] # Valid values for get_historic
+    if user_get_historic[0] not in valid_get_historic:
+        return "Error: Enter valid value for get_historic. (T or F)."
+
+
+    # Check is received source is valid and live
+    user_source = user_args['source'][0]  # Received source argument
+    source_live_db = cursor.execute("SELECT UPDATE_SUCCESS FROM SOURCE_DETAILS WHERE SOURCE_ID = ?", [user_source])
+    is_source_live = source_live_db.fetchone()
+    if not is_source_live:
+        return "Error: source " + str(user_source) + " is an invalid source. Please select another source"
+    elif (user_get_historic == "F" and "F" in is_source_live):
+        return "Error: source " + str( user_source) + " is unavailable. Please select another source"
+        # # # # What happend if the use hisotric is "T"?
+
+
+    # Retrieve currency exchange rate information from the database based on source argument
+    user_currencies = user_args["currency"] # Received currency argument
+    # Retrieves one or multiple but not all currencies
+    if "FULL" not in user_currencies:
+        user_currency_table = "CREATE TEMP TABLE currencies (TARGET);"
+        cursor.execute(user_currency_table)
+        conn.commit()
+        for currency in user_currencies:
+            cursor.execute("INSERT INTO currencies (TARGET) VALUES (?);", [currency])
+        conn.commit()
+        db_currency_table = cursor.execute("SELECT TARGET, DESCRIPTION, VALUE FROM CURRENT_RATES WHERE TARGET IN (SELECT TARGET FROM currencies) and SOURCE_ID = ? ORDER BY TARGET ASC;", [user_source])
+    else:
+        # Retrieves all currencies
+        db_currency_table = cursor.execute("SELECT TARGET, DESCRIPTION, VALUE FROM CURRENT_RATES WHERE SOURCE_ID = ? ORDER BY TARGET ASC;", [user_source])
+    currency_results = db_currency_table.fetchall()
+    columns = [string.capwords(column[0]) for column in cursor.description]
+
+
+
+    # Retrieves the base currency code and base exchange rate for the source argument
+    source_result = cursor.execute("SELECT SOURCE, REFERENCE_CURRENCY, REF_RATE, REF_DESCRIPTION FROM SOURCE_DETAILS WHERE SOURCE_ID = ?;", [user_source])
+    source_result_table = source_result.fetchone()
+   
+    source_base = source_result_table[1]
+    source_base_rate = source_result_table[2]
+    source_base_description = source_result_table[3]
+    multiplier = source_base_rate
+
+
+    # Retrieves the source base and source base rate only if specified by the currency argument
+
+    if (source_base in user_currencies or "FULL" in user_currencies):
+        new_base_row = [source_base, source_base_description, source_base_rate]
+        currency_results.append(new_base_row)
+        valid_currencies = [x[0] for x in currency_results]
+        for user_currency in user_currencies:
+                if user_currency not in valid_currencies and user_currency != "FULL":
+                    return "Error: " + user_currency + " is not a valid currency in " + user_source
+
+
+    # Calculates the inverse exchange rate for the given user base if change of base is required
+    user_base = user_args["change_base"][0]
+
+    if user_base != source_base:
+        
+        cursor.execute("SELECT TARGET, VALUE FROM CURRENT_RATES WHERE SOURCE_ID = ? AND TARGET = ?", [user_source, user_base])
+        new_ref_table = cursor.fetchone()
+        if new_ref_table:
+            new_base = new_ref_table[0]
+            new_base_rate = new_ref_table[1]
+            multiplier = source_base_rate / new_base_rate
+        else:
+            return "Error: Invalid change_base parameter"
+    else:
+        new_base = source_base
+
+    # Convert list of tuples to list of lists to convert the rates for the new base
+    currency_results = [list(row) for row in currency_results]
+
+
+    # Sort by three digit currency code
+    currency_results = sorted(currency_results, key=lambda row: row[0])
+
+
+    # # # # Builds an XML object based on user arguments -------Can we make this a function call?
+    if len(currency_results) > 0:
+        string_data = build_xml(currency_results, columns, source_base, user_base, new_base, multiplier)
+        conn.close()
+        response = app.response_class(string_data, mimetype = 'application/xml')
+        header = response.headers
+        header['Access-Control-Allow-Origin'] = '*/*'
+        return response
+    else:
+        conn.close()
+        return "Error: Currency is invalid."
+
+if __name__ == "__main__":
+    app.run(host='192.168.17.76', port=5001, debug=True)
+
